@@ -15,7 +15,14 @@ async function deployFixture() {
 
     const MockMerchant = await ethers.getContractFactory("MockMerchant");
     const merchant = await MockMerchant.deploy();
-    return { owner, stranger, entryPoint, wallet, merchant };
+
+    // pre-compute commonly-used addresses + chainId so tests don't repeat this
+    const walletAddr = await wallet.getAddress();
+    const merchantAddr = await merchant.getAddress();
+    const entryPointAddr = await entryPoint.getAddress();
+    const chainId = (await ethers.provider.getNetwork()).chainId;
+
+    return { owner, stranger, entryPoint, wallet, merchant, walletAddr, merchantAddr, entryPointAddr, chainId  };
 }
 
 // * Mirror of the contract's id math: keccak256(abi.encode(wallet, merchant, nonce)).
@@ -35,21 +42,18 @@ async function setupSubscription({
     fundWei = 0n,
 } = {}) {
     const base = await deployFixture();
-    const { owner, wallet, merchant } = base;
-    const walletAddr = await wallet.getAddress();
-    const merchantAddr = await merchant.getAddress();
+    const { owner, wallet, merchant, walletAddr, merchantAddr } = base;
 
     if (fundWei > 0n) {
-        await owner.sendTransaction({ to: walletAddr, value: fundWei });
+        await owner.sendTransaction({ to: base.walletAddr, value: fundWei });
     }
 
     await wallet.createSubscription(merchantAddr, maxAmount, interval, expiry);
-    const subscriptionId = computeSubId(walletAddr, merchantAddr, 0);
+    const subscriptionId = computeSubId(base.walletAddr, merchantAddr, 0);
 
-    return { ...base, walletAddr, merchantAddr, subscriptionId };
+    return { ...base,subscriptionId };
 }
 
-// * test for createSubscription function
 describe("createSubscription", function () {
     it("owner can create a subscription and event is emitted", async function () {
         const { owner, wallet, merchant } = await loadFixture(deployFixture);
@@ -129,7 +133,6 @@ describe("createSubscription", function () {
     });
 });
 
-// * test for charge function
 describe("charge", function () {
     // * charge：funded with 1 ETH so charges have balance. expiry is the only knob.
     function chargeFixture(expiry = 0) {
@@ -196,7 +199,6 @@ describe("charge", function () {
     });
 });
 
-// * test for cancelSubscription function
 describe("cancelSubscription", function () {
     // * cancel：no funding (cancel never touches ETH). defaults are fine.
     function cancelFixture() {
@@ -287,5 +289,172 @@ describe("charge reentrancy", function () {
         const sub = await wallet.subscriptions(subscriptionId);
         expect(sub.active).to.equal(true);     // not cancelled
         expect(sub.lastCharged).to.be.gt(0);   // charged exactly once
+    });
+});
+
+describe("validateUserOp", function () {
+    it("returns 0 for a valid owner signature", async function () {
+        const { owner, entryPoint, walletAddr, entryPointAddr, chainId } = await loadFixture(deployFixture);        
+
+        // 1. build a UserOp with sender = walletAddr
+        // 2. sign it with owner (signUserOp → fills userOp.signature)
+        // 3. call entryPoint.callValidateUserOp(walletAddr, signedUserOp, userOpHash, 0)
+        // 4. assert validationData == 0
+        const userOp = buildUserOp({ sender: walletAddr });
+        const signedUserOp = await signUserOp(userOp, owner, entryPointAddr, chainId);
+        const userOpHash = getUserOpHash(userOp, entryPointAddr, chainId);
+
+        // * func in MockEntryPoint.sol, missingAccountFunds = 0
+        await entryPoint.callValidateUserOp(walletAddr, signedUserOp, userOpHash, 0);
+        const validationData = await entryPoint.lastValidationData();
+        expect(validationData).to.equal(0);     // return 0 for valid signature
+    });
+
+    it("returns 1 for an invalid signature", async function () {
+        const { stranger, entryPoint, walletAddr, entryPointAddr, chainId } = await loadFixture(deployFixture);        
+        const strangerAddr = await stranger.getAddress();
+
+        // * sign with stranger, should return 1
+        const userOp = buildUserOp({ sender: walletAddr });
+        const signedUserOp = await signUserOp(userOp, stranger, entryPointAddr, chainId);
+        const userOpHash = getUserOpHash(userOp, entryPointAddr, chainId);
+
+        await entryPoint.callValidateUserOp(walletAddr, signedUserOp, userOpHash, 0);
+        const validationData = await entryPoint.lastValidationData();
+        expect(validationData).to.equal(1);
+    })
+
+    it("prefunds the EntryPoint when missingAccountFunds > 0", async function () {
+        const { owner, entryPoint, walletAddr, entryPointAddr, chainId } = await loadFixture(deployFixture);
+
+        // missingAccountFunds = the gas prepayment the wallet still owes the
+        // EntryPoint for this UserOp. When > 0, validateUserOp must transfer it
+        // to the EntryPoint (msg.sender) during validation.
+        const missingAccountFunds = ethers.parseEther("0.1");
+
+        // 1. fund the wallet first (it needs ETH to prepay)
+        //    → owner.sendTransaction({ to: walletAddr, value: ??? })
+        // 2. build + sign UserOp (valid owner signature, same as happy path)
+        // 3. call callValidateUserOp with missingAccountFunds = some value > 0
+        // 4. assert：
+        //    - lastValidationData == 0（valid signature）
+        //    - entryPoint.totalPrefundReceived() == missingAccountFunds
+        await owner.sendTransaction({ to: walletAddr, value: ethers.parseEther("1.0") });
+        const userOp = buildUserOp({ sender: walletAddr });
+        const signedUserOp = await signUserOp(userOp, owner, entryPointAddr, chainId);
+        const userOpHash = getUserOpHash(userOp, entryPointAddr, chainId);
+
+        await entryPoint.callValidateUserOp(walletAddr, signedUserOp, userOpHash, missingAccountFunds);
+        expect(await entryPoint.lastValidationData()).to.equal(0);
+        expect(await entryPoint.totalPrefundReceived()).to.equal(missingAccountFunds);
+    });
+
+    it("reverts when called by a non-EntryPoint address", async function () {
+        const { owner, wallet, stranger, entryPoint, walletAddr, entryPointAddr, chainId } = await loadFixture(deployFixture);
+
+        // build + sign a perfectly valid UserOp
+        const userOp = buildUserOp({ sender: walletAddr });
+        const signedUserOp = await signUserOp(userOp, owner, entryPointAddr, chainId);
+        const userOpHash = getUserOpHash(userOp, entryPointAddr, chainId);
+
+        // call validateUserOp DIRECTLY on the wallet (bypassing MockEntryPoint),
+        // connected as stranger → msg.sender != entryPoint → onlyEntryPoint blocks it.
+        await expect(
+            wallet.connect(stranger).validateUserOp(signedUserOp, userOpHash, 0)
+        ).to.be.revertedWith("SmartWallet: not EntryPoint");
+    });
+
+    it("returns 1 for a signature from a different chainId (replay resistance)", async function () {
+        const { owner, entryPoint, walletAddr, entryPointAddr, chainId } = await loadFixture(deployFixture);
+
+        const userOp = buildUserOp({ sender: walletAddr });
+
+        // sign against a WRONG chainId (simulating a signature minted on another chain),
+        // but the EntryPoint verifies against the REAL chainId.
+        // signer recovered from the wrong-chain signature != owner → 1
+        const signedUserOp = await signUserOp(userOp, owner, entryPointAddr, chainId + 1n);
+        const userOpHash = getUserOpHash(userOp, entryPointAddr, chainId);
+        await entryPoint.callValidateUserOp(walletAddr, signedUserOp, userOpHash, 0);
+        expect(await entryPoint.lastValidationData()).to.equal(1);
+    });
+
+    it("does not revert when wallet cannot afford the prefund", async function () {
+        const { owner, entryPoint, walletAddr, entryPointAddr, chainId } = await loadFixture(deployFixture);
+
+        // → balance is 0, cannot pay the prefund
+        const missingAccountFunds = ethers.parseEther("0.1");
+
+        // build + sign a valid UserOp
+        const userOp = buildUserOp({ sender: walletAddr });
+        const signedUserOp = await signUserOp(userOp, owner, entryPointAddr, chainId);
+        const userOpHash = getUserOpHash(userOp, entryPointAddr, chainId);
+
+        // even though the prefund transfer fails (balance 0), validateUserOp must
+        // still return 0 and NOT revert — the `(ok);` line intentionally ignores
+        // the failed transfer (avoids triggering bundler blacklist).
+        await entryPoint.callValidateUserOp(walletAddr, signedUserOp, userOpHash, missingAccountFunds);
+        expect(await entryPoint.lastValidationData()).to.equal(0);
+        expect(await entryPoint.totalPrefundReceived()).to.equal(0n);  // nothing transferred
+    });
+});
+
+describe("execute", function () {
+    it("owner can execute a plain ETH transfer to a target", async function () {
+        const { owner, wallet, merchant, walletAddr, merchantAddr } = await loadFixture(deployFixture);
+
+        // fund the wallet so it can forward ETH
+        await owner.sendTransaction({ to: walletAddr, value: ethers.parseEther("1.0") });
+
+        const value = ethers.parseEther("0.1");
+        
+        // owner calls execute(target=merchant, value, data="0x")
+        // → low-level call forwards `value` ETH to merchant's receive()
+        await wallet.execute(merchantAddr, value, "0x");
+
+        // assert: merchant.totalReceived() == value
+        expect(await merchant.totalReceived()).to.equal(value);
+    });
+
+    it("EntryPoint can drive a charge end-to-end via execute", async function () {
+        // this is the full Path C: callExecute → wallet.execute → wallet.charge
+        const ctx = await setupSubscription({ fundWei: ethers.parseEther("1.0") });
+        const { wallet, merchant, entryPoint, walletAddr, subscriptionId, merchantAddr } = ctx;
+        const amount = 500n;
+
+        // encode the charge(subscriptionId, amount) call
+        const chargeData = wallet.interface.encodeFunctionData("charge", [subscriptionId, amount]);
+
+        // EntryPoint drives execute, with target = the wallet ITSELF so that
+        // inside charge, msg.sender == address(this) → Path C branch.
+        // * para: (wallet, target, value, data), target = walletAddr means the wallet call itself,
+        // * value = 0 means the charge pulls from the waller'a balance, not from msg.value
+        await expect(
+            entryPoint.callExecute(walletAddr, walletAddr, 0, chargeData)
+        ).to.emit(wallet, "Charged").withArgs(subscriptionId, merchantAddr, amount);
+
+        expect(await merchant.totalReceived()).to.equal(amount);
+    });
+
+    it("reverts when called by an unauthorized address", async function () {
+        const { stranger, wallet, merchant, walletAddr } = await loadFixture(deployFixture);
+        // stranger calls execute → not entryPoint, not owner → revert
+        const amount = 500n;
+        await expect(
+            wallet.connect(stranger).execute(walletAddr, 0, "0x")
+        ).to.be.revertedWith("SmartWallet: not authorized");
+    });
+
+    it("bubbles up the target's revert reason", async function () {
+        const { owner, wallet, merchant, walletAddr, merchantAddr } = await loadFixture(deployFixture);
+
+        await owner.sendTransaction({ to: walletAddr, value: ethers.parseEther("1.0") });
+        await merchant.setShouldRevert(true);        
+
+        // owner executes an ETH transfer to merchant → merchant's receive() reverts
+        // assert the OUTER execute reverts with the INNER (target's) message,
+        // proving the assembly bubble-up works:
+        await expect(
+            wallet.execute(merchantAddr, ethers.parseEther("0.1"), "0x")
+        ).to.be.revertedWith("MockMerchant: Payment rejected");
     });
 });
