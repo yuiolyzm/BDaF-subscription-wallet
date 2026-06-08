@@ -27,7 +27,6 @@ async function main() {
 	// ============================================================
 	// Phase 1 — counterfactual deployment (UserOp #0)
 	// ============================================================
-	// Fresh salt per run => new wallet => Phase 1 always deploys.
 	// For the "official record" run, hardcode salt to fix the address.
 	const salt = ethers.id("demo-v1");
 
@@ -80,7 +79,7 @@ async function main() {
 	console.log("Wallet deployed via first UserOp (counterfactual)");
 
 	// ============================================================
-	// Phase 2 — authorize 3 subscriptions (owner calls directly)  [TODO]
+	// Phase 2 — authorize 3 subscriptions (owner calls directly)
 	// ============================================================
 	// owner calls wallet.createSubscription(...) x3 (Netflix / Billing / Usage).
 	// onlyOwner => must be the owner EOA directly, NOT via UserOp (see earlier design note).
@@ -113,7 +112,7 @@ async function main() {
 	const ctx = { entryPoint, wallet, owner, bundler, sw };
 
 	// ------------------------------------------------------------
-	// Helper: charge one subscription through the full 4337 path (Path C).
+	// Helper: charge one subscription through the full 4337 path via EntryPoint -> execute -> charge.
 	// Same submit flow as Phase 1, but: non-empty callData, empty initCode,
 	// modest gas (no deploy this time). Returns the receipt.
 	// ------------------------------------------------------------
@@ -145,7 +144,7 @@ async function main() {
 	}
 
 	// ============================================================
-	// Phase 3 — charge each mode via UserOp (Path C)  
+	// Phase 3 — charge each mode via UserOp path (EntryPoint → execute → charge)  
 	// ============================================================
 	// Netflix = max (fixed price, no merchant headroom)
 	// Billing < max (post-paid partial bill, merchant decides how much within cap)

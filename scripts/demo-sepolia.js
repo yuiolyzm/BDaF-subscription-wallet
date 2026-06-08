@@ -29,7 +29,8 @@ const WALLET_ABI = [
 const MERCHANT_ABI = ["function totalReceived() view returns (uint256)"];
 
 // Scaled 1/100 vs local demo to conserve Sepolia test ETH; gas dominates anyway.
-const PREFUND = ethers.parseEther("0.03");
+const PREFUND = ethers.parseEther("0.05");
+const MIN_PRIORITY = 200_000_000n;
 const CHARGE_AMOUNTS = {
     Netflix: ethers.parseEther("0.00001"),
     Billing: ethers.parseEther("0.00003"),
@@ -39,7 +40,19 @@ const DAY = 24 * 60 * 60;
 
 const toHex = (v) => "0x" + BigInt(v).toString(16);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const bump = (x) => (BigInt(x) * 125n) / 100n; // add 25% to avoid "underpriced" rejection
+const bump = (x) => {
+    const bumped = (BigInt(x) * 125n) / 100n;
+    return bumped > MIN_PRIORITY ? bumped : MIN_PRIORITY;
+};  // add 25% or 0.2gwei, prevent rejection due to low priority fee
+
+async function ensureBalance(provider, funder, target, minAmount) {
+    const bal = await provider.getBalance(target);
+    if (bal < minAmount) {
+        const fundTx = await funder.sendTransaction({ to: target, value: minAmount - bal });
+        await fundTx.wait();
+        console.log(`Balance ensured -> ${ethers.formatEther(await provider.getBalance(target))} ETH`);
+    }
+}
 
 // Re-pack an unpacked op into bytes32 form, only to compute userOpHash on-chain.
 function packForHash(op) {
@@ -86,7 +99,9 @@ async function sendUserOpViaBundler(provider, entryPoint, owner, partialOp) {
         nonce: toHex(partialOp.nonce),
         callData: partialOp.callData,
         callGasLimit: toHex(1_000_000n),
-        verificationGasLimit: toHex(1_000_000n),
+        // Deployment path needs higher ceiling: SmartWallet constructor +
+        // factory call easily exceeds 1M; bundler simulates against this cap.
+        verificationGasLimit: toHex(partialOp.factory ? 2_200_000n : 60_000n),
         preVerificationGas: toHex(100_000n),
         maxFeePerGas: toHex(bump(fee.maxFeePerGas)),
         maxPriorityFeePerGas: toHex(bump(fee.maxPriorityFeePerGas)),
@@ -97,6 +112,7 @@ async function sendUserOpViaBundler(provider, entryPoint, owner, partialOp) {
         op.factoryData = partialOp.factoryData; // NOT a single packed initCode
     }
 
+    // EntryPoint addrv0.6/v0.7 coexist with different ABIs, and bundler needs version to estimate gas.
     const est = await provider.send("eth_estimateUserOperationGas", [op, ENTRYPOINT]);
     op.callGasLimit = est.callGasLimit;
     op.verificationGasLimit = est.verificationGasLimit;
@@ -132,49 +148,57 @@ async function main() {
     console.log("Network : sepolia (real bundler)");
     console.log("Owner   :", owner.address);
 
-    // ===== Phase 1 — counterfactual deployment via the real bundler =====
-    const salt = ethers.hexlify(ethers.randomBytes(32)); // fresh => always deploys
+	// ============================================================
+	// Phase 1 — counterfactual deployment (UserOp #0)
+	// ============================================================
+    // prefund wallet then deploy via bundler
+    const salt = ethers.id("demo-sepolia-v1"); // Fixed salt => deterministic wallet address; reuses funded wallet across runs.
     const wallet = await factory.getWalletAddress(owner.address, salt);
     console.log("Counterfactual wallet:", wallet);
 
-    const bal = await provider.getBalance(wallet);
-    if (bal < PREFUND) {
-        const fundTx = await owner.sendTransaction({ to: wallet, value: PREFUND - bal });
-        await fundTx.wait();
-        // Wait for the funding tx to confirm, then read the balance back to verify
-        // the funds actually landed before submitting the op (else bundler -> AA21).
-        const after = await provider.getBalance(wallet);
-        console.log("Prefunded wallet ->", ethers.formatEther(after), "ETH");
+    const code = await provider.getCode(wallet);
+    const alreadyDeployed = code !== "0x";
+
+    if (alreadyDeployed) {
+        console.log("[Phase 1] wallet already deployed, skipping");
+    } else {
+        await ensureBalance(provider, owner, wallet, PREFUND);
+        const factoryData = factory.interface.encodeFunctionData("createWallet", [owner.address, salt]);
+        const nonce0 = await entryPoint.getNonce(wallet, 0n);
+
+        console.log("[Phase 1] deploying wallet via bundler...");
+        await sendUserOpViaBundler(provider, entryPoint, owner, {
+            sender: wallet,
+            nonce: nonce0,
+            callData: "0x",
+            factory: d.factory,
+            factoryData,
+        });
+        if ((await provider.getCode(wallet)) === "0x") throw new Error("Wallet not deployed");
+        console.log("[Phase 1] wallet deployed counterfactually via real bundler");
     }
 
-    const factoryData = factory.interface.encodeFunctionData("createWallet", [owner.address, salt]);
-    const nonce0 = await entryPoint.getNonce(wallet, 0n);
-
-    console.log("[Phase 1] deploying wallet via bundler...");
-    await sendUserOpViaBundler(provider, entryPoint, owner, {
-        sender: wallet,
-        nonce: nonce0,
-        callData: "0x",
-        factory: d.factory,
-        factoryData,
-    });
-    if ((await provider.getCode(wallet)) === "0x") throw new Error("Wallet not deployed");
-    console.log("[Phase 1] wallet deployed counterfactually via real bundler");
-
+    await ensureBalance(provider, owner, wallet, PREFUND);
     const sw = new ethers.Contract(wallet, WALLET_ABI, owner);
 
-    // ===== Phase 2 — authorize 3 subscriptions (owner calls directly, onlyOwner) =====
+	// ============================================================
+	// Phase 2 — authorize 3 subscriptions (owner calls directly)
+	// ============================================================
     const now = (await provider.getBlock("latest")).timestamp;
     const modes = [
+		//* Netflix: fixed fee. cap == price => zero headroom for the merchant.
+		//* Billing: post-paid, variable amount within a monthly cap (headroom by design).
+		//* Usage: small + frequent. short interval => many pulls; watch AGGREGATE exposure.
         { name: "Netflix", max: ethers.parseEther("0.00001"),  interval: 30 * DAY, expiry: now + 365 * DAY },
         { name: "Billing", max: ethers.parseEther("0.00005"),  interval: 30 * DAY, expiry: now + 365 * DAY },
-        { name: "Usage",   max: ethers.parseEther("0.000002"), interval: 300,      expiry: now + 30 * DAY },
+        { name: "Usage",   max: ethers.parseEther("0.000002"), interval: 30,       expiry: now + 30 * DAY },
     ];
 
     const subIds = {};
     for (const mode of modes) {
         const tx = await sw.createSubscription(d.merchant, mode.max, mode.interval, mode.expiry);
         const rcpt = await tx.wait(); // real chain: wait for confirmation
+		//* subscriptionId is a RETURN value => read it from the SubscriptionCreated event, not the tx result.
         const ev = rcpt.logs
             .map((l) => { try { return sw.interface.parseLog(l); } catch { return null; } })
             .find((p) => p && p.name === "SubscriptionCreated");
@@ -182,46 +206,62 @@ async function main() {
         console.log(`[Phase 2] ${mode.name.padEnd(8)} subId: ${subIds[mode.name]}`);
     }
 
-    // ===== Phase 3 — charge each mode via the real bundler (Path C) =====
+	// ============================================================
+	// Phase 3 — charge each mode via UserOp path (EntryPoint → execute → charge) 
+	// ============================================================
+	// Netflix = max (fixed price, no merchant headroom)
+	// Billing < max (post-paid partial bill, merchant decides how much within cap)
+	// Usage   < max (micro-charge per usage event)
     for (const mode of modes) {
         const chargeData = sw.interface.encodeFunctionData("charge", [subIds[mode.name], CHARGE_AMOUNTS[mode.name]]);
         const callData = sw.interface.encodeFunctionData("execute", [wallet, 0, chargeData]);
         const nonce = await entryPoint.getNonce(wallet, 0n);
         console.log(`[Phase 3] charging ${mode.name}...`);
-        // No factory/factoryData: wallet already exists, else bundler -> AA10.
+        // No factory/factoryData: wallet already exists, else bundler -> account not deployed (AA10).
         await sendUserOpViaBundler(provider, entryPoint, owner, { sender: wallet, nonce, callData });
     }
     console.log(`[Phase 3] Merchant totalReceived: ${ethers.formatEther(await merchant.totalReceived())} ETH`);
 
-    // ===== Phase 4 — cancel Netflix + Usage, prove their charges now fail =====
-    // No evm_increaseTime on a real chain: this proves cancel-scoping only, not
-    // the interval guard (that proof stays in the local fork demo).
+    // ============================================================
+    // Phase 4 — cancel Netflix + Billing, prove Usage still works
+    // ============================================================
     await (await sw.cancelSubscription(subIds["Netflix"])).wait();
-    await (await sw.cancelSubscription(subIds["Usage"])).wait();
-    console.log("[Phase 4] Netflix + Usage cancelled");
+    await (await sw.cancelSubscription(subIds["Billing"])).wait();
+    console.log("[Phase 4] Netflix + Billing cancelled");
 
-    const totalBefore = await merchant.totalReceived();
-
-    for (const name of ["Netflix", "Usage"]) {
+    for (const name of ["Netflix", "Billing"]) {
         const chargeData = sw.interface.encodeFunctionData("charge", [subIds[name], CHARGE_AMOUNTS[name]]);
         const callData = sw.interface.encodeFunctionData("execute", [wallet, 0, chargeData]);
         const nonce = await entryPoint.getNonce(wallet, 0n);
         console.log(`[Phase 4] attempting ${name} charge (should fail)...`);
-        const r = await sendUserOpViaBundler(provider, entryPoint, owner, { sender: wallet, nonce, callData });
-        if (r.success) throw new Error(`${name} charge should have failed`);
-        console.log(`[Phase 4] ${name} charge rejected (success=false)`);
+
+        try {
+            const r = await sendUserOpViaBundler(provider, entryPoint, owner, { sender: wallet, nonce, callData });
+            if (r.success) throw new Error(`${name} charge should have failed`);
+            console.log(`[Phase 4] ${name} rejected on-chain (success=false)`);
+        } catch (e) {
+            if (e.message.includes("subscription not active")) {
+                console.log(`[Phase 4] ${name} rejected at bundler simulation (cancel proved effective)`);
+            } else {
+                throw e;
+            }
+        }
     }
 
-    const billingData = sw.interface.encodeFunctionData("charge", [subIds["Billing"], CHARGE_AMOUNTS["Billing"]]);
-    const billingCall = sw.interface.encodeFunctionData("execute", [wallet, 0, billingData]);
-    const nonceB = await entryPoint.getNonce(wallet, 0n);
-    console.log("[Phase 4] charging Billing (should still work)...");
-    const rb = await sendUserOpViaBundler(provider, entryPoint, owner, { sender: wallet, nonce: nonceB, callData: billingCall });
-    if (!rb.success) throw new Error("Billing charge should have succeeded");
-    console.log("[Phase 4] Billing still works (cancel is per-subscription)");
+    // Wait for Usage interval to elapse, then re-charge to prove cancel is per-subscription.
+    console.log("[Phase 4] waiting for Usage interval to elapse...");
+    await sleep(35_000); // 30s interval + 5s buffer
+
+    const totalBefore = await merchant.totalReceived();
+    const usageData = sw.interface.encodeFunctionData("charge", [subIds["Usage"], CHARGE_AMOUNTS["Usage"]]);
+    const usageCall = sw.interface.encodeFunctionData("execute", [wallet, 0, usageData]);
+    const nonceU = await entryPoint.getNonce(wallet, 0n);
+    const ru = await sendUserOpViaBundler(provider, entryPoint, owner, { sender: wallet, nonce: nonceU, callData: usageCall });
+    if (!ru.success) throw new Error("Usage charge should have succeeded");
+    console.log("[Phase 4] Usage still works (cancel is per-subscription)");
 
     const totalAfter = await merchant.totalReceived();
-    console.log(`[Phase 4] Merchant received only the Billing charge: +${ethers.formatEther(totalAfter - totalBefore)} ETH`);
+    console.log(`[Phase 4] Merchant received only the Usage charge: +${ethers.formatEther(totalAfter - totalBefore)} ETH`);
     console.log("\nDone. Check the tx hashes above on https://sepolia.etherscan.io");
 }
 

@@ -24,7 +24,6 @@ module.exports = {
 			accounts: [
 				process.env.DEPLOYER_KEY,
 				process.env.OWNER_KEY,
-				process.env.BUNDLER_KEY,
 			].filter(Boolean),
 		},
 	},

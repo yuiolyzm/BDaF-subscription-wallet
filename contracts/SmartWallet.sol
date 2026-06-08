@@ -202,8 +202,8 @@ contract SmartWallet {
      * @notice Pull `amount` wei to the authorized merchant for `subscriptionId`.
      *
      * Call paths:
-     *   Path C: msg.sender == address(this)  ← EntryPoint → execute → charge
-     *   Path A: msg.sender == sub.merchant   ← Merchant EOA directly (demo)
+     *   Path C: msg.sender == address(this)  ← EntryPoint → execute → charge  (UserOp path; Phase 3/4)
+     *   Path A: msg.sender == sub.merchant   ← Merchant pulls directly (contract)
      *
      * Defense in depth: every constraint is re-checked here, even if the caller
      * already passed EntryPoint validation.

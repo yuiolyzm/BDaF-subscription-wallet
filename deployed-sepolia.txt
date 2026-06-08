@@ -1,0 +1,30 @@
+Network : sepolia (real bundler)
+Owner   : 0x3fC84D19FbaD7C7FbaA57ef0feBA5A0a8936d0B4
+Counterfactual wallet: 0xf63D252CeFd11e269809520D297a9dE9804f0206
+[Phase 1] wallet already deployed, skipping
+Balance ensured -> 0.05 ETH
+[Phase 2] Netflix  subId: 0xe9fd9ea186437e3e7e4b3510e8cda9d98393b3f87b6d3cb20fd86b358091590e
+[Phase 2] Billing  subId: 0x0d2459187db970ab0b5b9f11929a966f0dcbdcae165ac744f86e4fe65cffb5d4
+[Phase 2] Usage    subId: 0x0a85dbdace068ed2d26160b7b99fb69307b33fdb84d37ed7b0d87384db622b2c
+[Phase 3] charging Netflix...
+   submitted, opHash: 0x63c03e677363648ff29c5a2e874683508fcd07f08cc453b6b1e0432f27e2e7fb
+   mined in tx: 0x5125a631785069db486e3746cb51096fe0b31d2e222de1b7068258c921b86834 | success: true
+[Phase 3] charging Billing...
+   submitted, opHash: 0xeaa60dd11d6cc2b23a2969544d68304eb7a5ec477d4c7ff8ee42c82346642af9
+   mined in tx: 0x1806c57eb0872ac8161e80fda4f760947eaa466bc59df1258120aaf43dc49c9c | success: true
+[Phase 3] charging Usage...
+   submitted, opHash: 0xbb75b5c550be8ae5e81d4fc025e99be01027d2019ada478a91ebd1edf0b6daf0
+   mined in tx: 0x258e86ecab9768418c666e27a77b065a02acad91f342cdc9626c9791ba124362 | success: true
+[Phase 3] Merchant totalReceived: 0.000165 ETH
+[Phase 4] Netflix + Billing cancelled
+[Phase 4] attempting Netflix charge (should fail)...
+[Phase 4] Netflix rejected at bundler simulation (cancel proved effective)
+[Phase 4] attempting Billing charge (should fail)...
+[Phase 4] Billing rejected at bundler simulation (cancel proved effective)
+[Phase 4] waiting for Usage interval to elapse...
+   submitted, opHash: 0x9288cea1df9d7c789ceacda79e7ed7ed54ef21bcb1cbd9e839c00f3693f4d71c
+   mined in tx: 0xb170c30ffd47a87918b23b686481092462cd137529add1abe0e3a42f85b6020d | success: true
+[Phase 4] Usage still works (cancel is per-subscription)
+[Phase 4] Merchant received only the Usage charge: +0.000001 ETH
+
+Done. Check the tx hashes above on https://sepolia.etherscan.io

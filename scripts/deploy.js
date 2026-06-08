@@ -6,7 +6,7 @@ const fs = require("fs");
 const ENTRYPOINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
 
 async function main() {
-    const [deployer, owner, bundler] = await ethers.getSigners();
+    const [deployer, owner] = await ethers.getSigners();
     const bal = await ethers.provider.getBalance(deployer.address);
     console.log("Network :", network.name);
     console.log("Deployer:", deployer.address);
@@ -39,7 +39,6 @@ async function main() {
         factory: factoryAddr,
         merchant: merchantAddr,
         owner: owner.address,
-        bundler: bundler.address,
     };
     fs.writeFileSync("deployed.json", JSON.stringify(out, null, 2));
 

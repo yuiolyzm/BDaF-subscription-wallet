@@ -416,7 +416,7 @@ describe("execute", function () {
     });
 
     it("EntryPoint can drive a charge end-to-end via execute", async function () {
-        // this is the full Path C: callExecute → wallet.execute → wallet.charge
+        // this is the full Path: callExecute → wallet.execute → wallet.charge
         const ctx = await setupSubscription({ fundWei: ethers.parseEther("1.0") });
         const { wallet, merchant, entryPoint, walletAddr, subscriptionId, merchantAddr } = ctx;
         const amount = 500n;
@@ -425,7 +425,7 @@ describe("execute", function () {
         const chargeData = wallet.interface.encodeFunctionData("charge", [subscriptionId, amount]);
 
         // EntryPoint drives execute, with target = the wallet ITSELF so that
-        // inside charge, msg.sender == address(this) → Path C branch.
+        // inside charge, msg.sender == address(this).
         // * para: (wallet, target, value, data), target = walletAddr means the wallet call itself,
         // * value = 0 means the charge pulls from the waller'a balance, not from msg.value
         await expect(
