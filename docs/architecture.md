@@ -1,49 +1,48 @@
-# 系統架構文件 — BDaF Subscription Wallet
+# System Architecture Document — BDaF Subscription Wallet
 
-> ERC-4337 訂閱錢包專案
+> ERC-4337 Subscription Wallet Project
 > Version: 1.0 | EntryPoint v0.7 | Solidity 0.8.28
 
 ---
 
-## 1. 專案概述
+## 1. Project Overview
 
-### 1.1 目標
+### 1.1 Goals
 
-實作一個基於 ERC-4337 (Account Abstraction) 的鏈上訂閱錢包，將傳統信用卡訂閱授權邏輯搬到區塊鏈，提供：
+Implement an on-chain subscription wallet based on ERC-4337 (Account Abstraction) to migrate traditional credit card subscription authorization logic onto the blockchain, providing:
 
-- **可驗證的扣款條件**（金額/間隔/到期寫在合約裡，商家無法繞過）
-- **隨時可撤銷**（user 一個 transaction 即可 cancel）
-- **三種訂閱模式並存**（Netflix / Billing / Usage 用同一個 charge() 實現）
+- **Verifiable Charge Conditions**: Amount, interval, and expiration are hardcoded within the contract state, preventing merchants from bypassing them.
+- **Instant Revocation**: Users can cancel a subscription at any time via a single transaction.
+- **Coexistence of Three Subscription Modes**: Netflix (Fixed), Billing (Variable), and Usage-based models are all implemented seamlessly via a single `charge()` function.
 
-### 1.2 與 Stripe Billing 的差異
+### 1.2 Differences from Stripe Billing
 
-| | Stripe Billing | 本專案 |
-|---|---------------|--------|
-| 信任模型 | 信任 Stripe 公司 | 信任合約程式碼 |
-| 授權儲存 | Stripe 中心化資料庫 | 鏈上 SmartWallet.subscriptions |
-| 撤銷方式 | 打給 Stripe / 登入儀表板 | 呼叫合約 cancelSubscription() |
-| 商家代付 gas | N/A | 可選 Paymaster |
-| Audit 可能性 | 需信任 Stripe 自我審計 | Etherscan verified source code |
+| Feature | Stripe Billing | This Project |
+|---|---|---|
+| **Trust Model** | Trust Stripe as a centralized entity | Trust the immutable smart contract code |
+| **Authorization Storage** | Stripe's centralized database | On-chain `SmartWallet.subscriptions` mapping |
+| **Revocation Method** | Contact Stripe / Log into dashboard | Call contract `cancelSubscription()` directly |
+| **Merchant-sponsored Gas**| N/A | Supported via optional Paymaster integration |
+| **Auditability** | Requires trusting Stripe's internal audits | Open-source, Etherscan-verified source code |
 
 ### 1.3 Scope
 
-- **Tier 1**：基礎 Smart Contract Wallet + UserOperation 流程 ✓
-- **Tier 2**：訂閱邏輯（三模式） + Cancel + Time Lock ✓
-- **Tier 3**：Paymaster 設計分析（無實作） + 安全性分析 ✓
-- **不包含**：Social recovery、Multi-sig、Cross-chain support
+- **Tier 1**: Core Smart Contract Wallet + UserOperation workflow ✓
+- **Tier 2**: Subscription logic (3 modes) + Cancel + Time Lock ✓
+- **Tier 3**: Paymaster design analysis (no implementation) + Security analysis ✓
+- **Excluded**: Social recovery, Multi-sig, Cross-chain support
 
 ---
 
-## 2. ERC-4337 角色對應
+## 2. ERC-4337 Role Mapping
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                    ERC-4337 整體架構                          │
+│                    ERC-4337 Overall Architecture             │
 └──────────────────────────────────────────────────────────────┘
 
   User EOA            Bundler             EntryPoint          SmartWallet
-  (簽 UserOp)         (打包送鏈)          (canonical          (本專案實作)
-                                          v0.7)
+(Signs UserOp)     (Bundles & Sends)     (Canonical v0.7)   (This Project)
      │                   │                   │                   │
      │── sign userOp ───▶│                   │                   │
      │                   │                   │                   │
@@ -60,82 +59,82 @@
      │                   │◀── refund ────────│                   │
 ```
 
-### 2.1 角色職責
+### 2.1 Role Responsibilities
 
-| 角色 | 實作來源 | 職責 |
+| Role | Implementation Source | Responsibility |
 |------|---------|------|
-| **User EOA** | 外部錢包 (Rabby) | 簽 UserOp（不送 tx、不需有 ETH） |
-| **Bundler** | Alchemy (Sepolia) / hardhat signer (local) | 收 UserOp、打包成 tx 送到 EntryPoint |
-| **EntryPoint** | Canonical v0.7 `0x0000...da032` | 強制驗證流程、扣 gas、退款 bundler |
-| **SmartWallet** | 本專案 `contracts/SmartWallet.sol` | validateUserOp + 業務邏輯（charge / cancel） |
-| **SmartWalletFactory** | 本專案 `contracts/SmartWalletFactory.sol` | CREATE2 部署 wallet |
-| **MockMerchant** | 本專案 `contracts/mocks/MockMerchant.sol` | 模擬商家收款 + CEI 驗證 |
-| **Paymaster** | 未實作 | （設計分析見 security-analysis.md） |
+| **User EOA** | External wallet (e.g., Rabby) | Signs the `UserOperation` (does not send tx, requires no ETH) |
+| **Bundler** | Alchemy (Sepolia) / Hardhat signer (local) | Collects UserOps, packages them into a tx, and submits to EntryPoint |
+| **EntryPoint** | Canonical v0.7 (`0x0000...da032`) | Enforces the verification loop, deducts gas, and refunds the bundler |
+| **SmartWallet** | `contracts/SmartWallet.sol` | Handles `validateUserOp` + core business logic (`charge` / `cancel`) |
+| **SmartWalletFactory** | `contracts/SmartWalletFactory.sol` | Deploys wallets deterministically using `CREATE2` |
+| **MockMerchant** | `contracts/mocks/MockMerchant.sol` | Simulates a merchant receiving funds + verifies CEI compliance |
+| **Paymaster** | Not implemented | Modeled and analyzed in `security-analysis.md` |
 
 ---
 
-## 3. 合約清單
+## 3. Contract List
 
 ### 3.1 SmartWallet.sol
 
-每個 user 的訂閱錢包合約。Constructor 寫死 owner + entryPoint，不可升級。
+The core subscription wallet contract for each user. The constructor hardcodes the `owner` and `entryPoint`, making it immutable and non-upgradable.
 
-**State**：
+**State Variables**:
 ```solidity
 address public immutable owner;
 address public immutable entryPoint;
 mapping(bytes32 => Subscription) public subscriptions;
-uint256 public subscriptionNonce; // for unique subscriptionId
+uint256 public subscriptionNonce; // for unique subscriptionId generation
 ```
 
-**Subscription struct**：
+**Subscription Struct**:
 ```solidity
 struct Subscription {
-    address merchant;              // 收款地址
-    uint256 maxAmountPerCharge;    // 單次金額上限
-    uint256 interval;              // 兩次扣款最短間隔（秒）
-    uint256 expiry;                // 整體有效期限（Unix timestamp）
-    uint256 lastChargedAt;         // 上次扣款時間（CEI 防重入用）
-    bool active;                   // cancel 後設 false
+    address merchant;              // Merchant receiving address
+    uint256 maxAmountPerCharge;    // Maximum allowable amount per charge
+    uint256 interval;              // Minimum required seconds between two charges
+    uint256 expiry;                // Overall expiration time (Unix timestamp)
+    uint256 lastChargedAt;         // Timestamp of the last charge (for CEI reentrancy defense)
+    bool active;                   // Set to false upon cancellation
 }
 ```
 
-**External functions**：
+**External Functions**:
 
-| Function | Access | 用途 |
+| Function | Access Control | Purpose |
 |----------|--------|------|
-| `validateUserOp(userOp, userOpHash, missingAccountFunds)` | onlyEntryPoint | ERC-4337 驗證入口 |
-| `execute(target, value, data)` | onlyEntryPoint OR onlyOwner | 執行任意 call |
-| `createSubscription(merchant, max, interval, expiry)` | onlyOwner | 建立訂閱授權 |
-| `cancelSubscription(subId)` | onlyOwner | 撤銷訂閱 |
-| `charge(subId, amount)` | public（由 subscriptionId 控管） | 商家或 self-call 觸發扣款 |
+| `validateUserOp(userOp, userOpHash, missingAccountFunds)` | `onlyEntryPoint` | Standard ERC-4337 validation entrypoint |
+| `execute(target, value, data)` | `onlyEntryPoint` OR `onlyOwner` | Executes arbitrary calls from the wallet |
+| `createSubscription(merchant, max, interval, expiry)` | `onlyOwner` | Creates and authorizes a new subscription |
+| `cancelSubscription(subId)` | `onlyOwner` | Revokes an active subscription |
+| `charge(subId, amount)` | `public` (Governed by subscriptionId validity) | Triggered by the merchant or self-call to pull funds |
 
 ### 3.2 SmartWalletFactory.sol
 
-CREATE2 deployer，所有 wallet 從這裡部署。
+A `CREATE2` deployer contract used to instantiate all user wallets.
 
-**Functions**：
-- `getWalletAddress(owner, salt)` — 預先計算 wallet 地址（counterfactual）
-- `createWallet(owner, salt)` — 部署 wallet（已部署則 return existing，冪等）
+**Functions**:
+- `getWalletAddress(owner, salt)`: Pre-calculates the wallet address (counterfactual address generation).
+- `createWallet(owner, salt)`: Deploys the wallet contract (idempotent; returns the existing address if already deployed).
 
 ### 3.3 MockMerchant.sol
 
-模擬商家行為 + 驗證 CEI 的 test contract。
+A test contract designed to simulate merchant behavior and strictly validate CEI patterns.
 
-**State**：
-- `totalReceived`：累計收到的 ETH
-- `reentryCount`：成功重入次數（應 == 0 if CEI works）
-- `targetWallet` / `targetSubId`：reentry attempt 的目標
+**State Variables**:
+- `totalReceived`: Cumulative ETH received.
+- `reentryCount`: Count of successful reentrancy attacks (should remain `0` if CEI functions correctly).
+- `targetWallet` / `targetSubId`: Execution targets for the reentrancy attempt.
 
-**Key behavior** — `receive()` 內 try-reenter charge()：
+**Key Behavior** — Inside `receive()`, attempts to re-enter `charge()`:
 ```solidity
 receive() external payable {
     totalReceived += msg.value;
     if (targetSubId != bytes32(0)) {
         try targetWallet.charge(targetSubId, 1) {
-            reentryCount++;  // CEI 失效才會進這裡
+            reentryCount++;  // Only increments if CEI fails
         } catch {
-            // 預期路徑：CEI 擋住重入
+            // Expected path: Reentrancy blocked by CEI checks
         }
     }
 }
@@ -143,15 +142,15 @@ receive() external payable {
 
 ### 3.4 MockEntryPoint.sol
 
-僅供 local hardhat 測試（避免依賴 mainnet fork）。Sepolia run 使用 canonical EntryPoint。
+Used exclusively for local Hardhat unit testing to eliminate mainnet/testnet fork dependencies. Canonical EntryPoint is utilized on Sepolia.
 
 ---
 
-## 4. 三模式統一架構（核心設計）
+## 4. Unified Architecture for the Three Modes (Core Design)
 
-### 4.1 設計哲學
+### 4.1 Design Philosophy
 
-**模式是參數空間，不是邏輯分支**。同一個 `charge()` 函數透過 `createSubscription` 的參數組合表現三種行為，**無 if-else**：
+**Modes are parameter spaces, not logical branches.** The single `charge()` function adapts to three distinct business models entirely based on the parameter configuration passed to `createSubscription`, bypassing complex `if-else` branching:
 
 ```solidity
 function charge(bytes32 subId, uint256 amount) external {
@@ -166,84 +165,84 @@ function charge(bytes32 subId, uint256 amount) external {
 }
 ```
 
-### 4.2 三模式參數對照
+### 4.2 Parameter Matrix by Mode
 
-| 模式 | maxAmountPerCharge | interval | expiry | 行為 |
+| Mode | maxAmountPerCharge | interval | expiry | Behavior |
 |------|--------------------|----------|--------|------|
-| **Netflix** | == 訂閱費 | 30 day | 長 | 固定金額月費 |
-| **Billing** | > 預期月帳 | 30 day | 長 | 後付帳單（商家在 cap 內決定金額） |
-| **Usage** | 微小 | 短（demo 用 30 sec） | 短（30 day） | 高頻微支付 |
+| **Netflix** | == Subscription Fee | 30 days | Long | Fixed recurring monthly fee |
+| **Billing** | > Expected Invoice | 30 days | Long | Post-paid billing (merchant specifies variable amount within cap) |
+| **Usage** | Small amount | Short (e.g., 30 sec for demo) | Short (30 days) | High-frequency micropayments |
 
-### 4.3 為何優於三個獨立 function
+### 4.3 Why This Architecture Beats Three Separate Functions
 
-| 比較 | 三個獨立 fn | 統一 charge() |
+| Metric | Three Separate Functions | Unified `charge()` |
 |------|------------|--------------|
-| 程式碼量 | 3x | 1x |
-| 攻擊面 | 3 入口 | 1 入口 |
-| Audit 成本 | 高 | 低 |
-| 新增模式 | 寫新 fn | 改參數即可 |
+| **Code Volume** | 3x | 1x |
+| **Attack Surface** | 3 Entrypoints | 1 Entrypoint |
+| **Audit Cost** | High | Low |
+| **Extensibility** | Requires writing new functions | Requires configuring new parameter sets |
 
 ---
 
-## 5. UserOperation 生命週期
+## 5. UserOperation Lifecycle
 
-### 5.1 完整流程（以 charge UserOp 為例）
+### 5.1 End-to-End Workflow (Example: `charge` UserOp)
 
 ```
-1. User EOA 在 client 端構造 UserOp
+1. User EOA constructs the UserOp on the client-side:
    - sender = wallet address
    - callData = execute(wallet, 0, charge(subId, amount))
-   - 計算 userOpHash（EntryPoint.getUserOpHash）
-   - signature = owner.signMessage(userOpHash)（EIP-191）
+   - Computes userOpHash via EntryPoint.getUserOpHash
+   - signature = owner.signMessage(userOpHash) (EIP-191 standard)
 
-2. Bundler 收到 UserOp
-   - eth_estimateUserOperationGas → bundler simulation 估 gas
-   - eth_sendUserOperation → bundler 提交
+2. Bundler receives the UserOp:
+   - eth_estimateUserOperationGas → Bundler simulates gas usage
+   - eth_sendUserOperation → UserOp is submitted to the mempool
 
-3. Bundler 把 UserOp 包進普通 tx
-   - tx.from = bundler EOA
+3. Bundler bundles the UserOp into a standard Ethereum transaction:
+   - tx.from = Bundler EOA
    - tx.to = EntryPoint
    - tx.data = handleOps([userOp], beneficiary)
    - tx.value = 0
 
-4. Block proposer 把 tx 打包進 block
+4. Block proposer mine and includes the tx into a block.
 
-5. EntryPoint.handleOps 執行
-   a. validation phase:
-      - 對 userOp 呼叫 wallet.validateUserOp(...)
-      - wallet 驗證簽名（ecrecover）
-      - wallet 補 prefund 給 EntryPoint
-      - return 0 表示通過
-   b. execution phase:
-      - 對 userOp 呼叫 wallet.execute(target, value, callData)
-      - execute 內呼叫 charge(subId, amount)（self-call）
-      - charge 執行 CEI 流程
-      - ETH 轉給 merchant
+5. EntryPoint.handleOps executes:
+   a. Validation Phase:
+      - Invokes wallet.validateUserOp(...)
+      - Wallet validates signature via ECDSA cryptography (ecrecover)
+      - Wallet prepays missing funds to the EntryPoint (prefund)
+      - Returns 0 to signify valid validation
+   b. Execution Phase:
+      - Invokes wallet.execute(target, value, callData)
+      - execute internally invokes charge(subId, amount) via self-call
+      - charge executes the CEI workflow
+      - ETH is transferred to the merchant
 
-6. EntryPoint 計算實際 gas，退款給 bundler
+6. EntryPoint calculates actual gas used and refunds the remaining balance to the Bundler.
 
-7. EntryPoint emit UserOperationEvent(success=true)
+7. EntryPoint emits UserOperationEvent(success=true).
 ```
 
-### 5.2 Counterfactual Deploy（第一次 UserOp 的特殊情況）
+### 5.2 Counterfactual Deployment (First UserOp Edge Case)
 
-第一次 UserOp 帶 `initCode = factory_address ++ createWallet(owner, salt)`：
+If the wallet hasn't been deployed yet, the first UserOp appends the `initCode = factory_address ++ createWallet(owner, salt)`:
 
 ```
 EntryPoint.handleOps:
-  - 偵測 sender 未部署
-  - 從 initCode 拆出 factory + factoryData
-  - 呼叫 factory.createWallet(owner, salt) 部署 wallet
-  - 繼續 validateUserOp + execute（如同一般 op）
+  - Detects that the sender account is not yet deployed
+  - Extracts factory and factoryData from initCode
+  - Calls factory.createWallet(owner, salt) to deploy the wallet
+  - Continues to validateUserOp + execute within the same atomic transaction
 ```
 
-**結果**：部署 + 第一次操作在同一個 tx 完成。
+**Outcome**: Deployment and the initial operation are completed atomically in one transaction.
 
 ---
 
-## 6. 簽名機制
+## 6. Signature Mechanism
 
-### 6.1 userOpHash 計算（ERC-4337 v0.7）
+### 6.1 `userOpHash` Calculation (ERC-4337 v0.7)
 
 ```
 userOpHash = keccak256(abi.encode(
@@ -252,129 +251,121 @@ userOpHash = keccak256(abi.encode(
     chainId
 ))
 ```
+Includes `entryPointAddress` and `chainId` to prevent cross-network and cross-version replay attacks.
 
-包含 entryPoint + chainId 防止 replay 攻擊。
-
-### 6.2 EIP-191 簽名
+### 6.2 EIP-191 Signature
 
 ```
 ethSignedHash = keccak256("\x19Ethereum Signed Message:\n32" ++ userOpHash)
 signature = sign(ethSignedHash, ownerPrivateKey)
 ```
+The client-side uses `ethers.signMessage(getBytes(userOpHash))`, matching `MessageHashUtils.toEthSignedMessageHash` + `ECDSA.recover` on the contract side.
 
-Client 端用 `ethers.signMessage(getBytes(userOpHash))`，合約端用 `MessageHashUtils.toEthSignedMessageHash` + `ECDSA.recover` 對齊。
-
-**選擇 EIP-191 而非 EIP-712 的理由**：
-- 教學專案重點在合約邏輯，非錢包 UX
-- EIP-191 實作簡短，容易解釋
-- production 通常 EIP-712（user 可看到 typed fields）
+**Rationale for choosing EIP-191 over EIP-712**:
+- As a learning-focused project, the priority is core contract logic rather than front-end UX.
+- EIP-191 yields a clean, concise implementation that is straightforward to explain.
+- Production environments typically pivot to EIP-712 for human-readable typed fields.
 
 ---
 
-## 7. 部署架構
+## 7. Deployment Architecture
 
-### 7.1 Sepolia 部署（已驗證）
+### 7.1 Sepolia Deployment (Verified)
 
-| 合約 | 地址 | Etherscan |
-|------|------|-----------|
-| EntryPoint (canonical v0.7) | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | Pre-existing |
-| SmartWalletFactory | `0x350A8816A25B684cF69cc92a307ba5D67CEb9cDf` | ✓ Verified |
-| MockMerchant | `0x2C34FC872D1057Dd9C9ED7B0c682f11eAA9f02E5` | ✓ Verified |
-| Demo SmartWallet | `0xf63D252CeFd11e269809520D297a9dE9804f0206` | (CREATE2 deployed) |
+| Contract | Address | Status / Etherscan |
+|---|---|---|
+| **EntryPoint (canonical v0.7)** | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` | Pre-existing |
+| **SmartWalletFactory** | `0x350A8816A25B684cF69cc92a307ba5D67CEb9cDf` | ✓ Verified |
+| **MockMerchant** | `0x2C34FC872D1057Dd9C9ED7B0c682f11eAA9f02E5` | ✓ Verified |
+| **Demo SmartWallet** | `0xf63D252CeFd11e269809520D297a9dE9804f0206` | Deployed via `CREATE2` |
 
-### 7.2 角色帳戶
+### 7.2 Role Accounts
 
-| 角色 | 從何來 |
+| Role | Source |
 |------|--------|
-| Deployer | DEPLOYER_KEY（部署 factory + merchant） |
-| Owner | OWNER_KEY（控制 wallet） |
-| Bundler (local) | hardhat signer |
-| Bundler (Sepolia) | Alchemy 服務 |
+| **Deployer** | `DEPLOYER_KEY` (Deploys factory + merchant) |
+| **Owner** | `OWNER_KEY` (Controls and owns the smart wallet) |
+| **Bundler (local)** | Hardhat automated signer |
+| **Bundler (Sepolia)** | Alchemy Bundler Service |
 
 ---
 
-## 8. Demo 雙路線
+## 8. Dual-Route Testing and Demonstration
 
-### 8.1 路線對比
+### 8.1 Route Comparison
 
-| | Local (`scripts/demo.js`) | Sepolia (`scripts/demo-sepolia.js`) |
-|---|---------------------------|--------------------------------------|
-| Bundler | hardhat signer 自扮 | Alchemy 真實服務 |
-| 提交方式 | `entryPoint.handleOps()` 直接呼叫 | 4 個 raw RPC (`eth_sendUserOperation` 等) |
-| Simulation | 無 | bundler 預先模擬 |
-| 失敗 op 處理 | 上鏈後 `success=false` | bundler 階段直接拒收 |
-| 時間操控 | `evm_increaseTime` | 真實等待 |
-| Reputation system | 無 | 有（ERC-7562） |
+| Metric | Local (`scripts/demo.js`) | Sepolia (`scripts/demo-sepolia.js`) |
+|---|---|---|
+| **Bundler** | Simulating manually via Hardhat signer | Real Alchemy Bundler network infrastructure |
+| **Submission** | Direct call to `entryPoint.handleOps()` | 4 standard JSON-RPC calls (`eth_sendUserOperation`, etc.) |
+| **Simulation** | None | Prefund and execution simulation enforced by Bundler |
+| **Failed Ops** | Lands on-chain with `success=false` | Rejected during the Bundler simulation phase directly |
+| **Time Controls** | Manipulated via `evm_increaseTime` | Real-time elapsed waiting intervals |
+| **Reputation** | Excluded | Enforced via ERC-7562 |
 
-### 8.2 雙路線的互補價值
+### 8.2 Complementary Values of the Dual Methodology
 
-**Local 證明**：合約邏輯正確、CEI 防重入、access control、三模式設計
-**Sepolia 證明**：bundler 接受、reputation 不封鎖、gas 經濟性合理、真實 mempool 行為
+- **Local Proof**: Validates core smart contract business logic, CEI protection against reentrancy, access control restrictions, and multi-mode architecture execution.
+- **Sepolia Proof**: Validates compatibility with live bundlers, proof of compliance with reputation guidelines, gas optimization metrics, and real-world mempool conditions.
 
-最具體的差異在 Phase 4：
-- Local 看到 `success=false` 上鏈
-- Sepolia 看到 bundler simulation **直接拒收**（更強的安全保證）
+The key divergence occurs in Phase 4:
+- Local testing registers a reverted operation on-chain as `success=false`.
+- Sepolia environment results in the bundler **outright rejecting the transaction simulation** (providing a more robust security model).
 
 ---
 
-## 9. 測試覆蓋
+## 9. Test Coverage Matrix
 
-| 測試類別 | 工具 | 涵蓋 |
+| Test Type | Tools Used | Scope Covered |
 |---------|------|------|
-| Unit tests | Hardhat + Chai | createSubscription / charge / cancel / validateUserOp |
-| Integration | Hardhat local fork | 完整 UserOp 流程 |
-| End-to-end (local) | scripts/demo.js | 4 phases × 三模式 |
-| End-to-end (Sepolia) | scripts/demo-sepolia.js | 真實 bundler + 7 UserOps |
-| Reentrancy | MockMerchant reentrancy test | totalReceived == amount, reentryCount == 0 |
+| **Unit Tests** | Hardhat + Chai | `createSubscription`, `charge`, `cancel`, `validateUserOp` |
+| **Integration** | Hardhat local fork | Complete atomic `UserOperation` loop |
+| **End-to-End (Local)** | `scripts/demo.js` | 4 phases across all 3 subscription configurations |
+| **End-to-End (Sepolia)** | `scripts/demo-sepolia.js` | Live bundler execution traversing 7 signed UserOps |
+| **Reentrancy Validation** | MockMerchant Strategy B | Confirms `totalReceived == amount` and `reentryCount == 0` |
 
 ---
 
 ## 10. Future Work
 
-未涵蓋在此 scope，但有設計思路：
+The following features sit outside the current project scope but are architected for future expansion:
 
-### 10.1 Paymaster
-
-商家代付 gas 機制。設計分析見 `security-analysis.md`。
+### 10.1 Paymaster Integration
+Enables merchants to sponsor gas fees for users. Detailed architectural analysis is logged in `security-analysis.md`.
 
 ### 10.2 Social Recovery
+Extends the ownership model from a single EOA to a multi-sig or guardian-based model to protect against key loss.
 
-Multi-sig recovery 機制（朋友協助換 owner）。需擴展 SmartWallet 為 multi-sig 或 guardian-based 設計。
+### 10.3 Upgrade to EIP-712 Signatures
+Replaces basic EIP-191 signatures with structured EIP-712 typed data to show clear, human-readable authorization cards to the user during signing.
 
-### 10.3 EIP-712 簽名
+### 10.4 Cross-EntryPoint Extensibility
+The `entryPoint` variable is bound as an `immutable` storage item. Production designs usually deploy a proxy structure to allow migration to updated EntryPoint versions.
 
-替換 EIP-191 為 EIP-712，提供 typed data 顯示，提升 UX 安全性。
+### 10.5 Calendar-Aware Intervals
+Replaces raw second-based math for tracking time intervals with a calendar-aware oracle to accommodate varying days in months and leap years.
 
-### 10.4 Cross-EntryPoint 升級
-
-當前 entryPoint 寫死在 immutable，無法升級。production 通常用 proxy + 部署新版 wallet 遷移。
-
-### 10.5 Calendar-aware Interval
-
-當前 interval 用秒計算，未考慮閏年/月份天數差異。production 可改用 oracle 提供 calendar-aware 月度時間戳。
-
-### 10.6 Front-run Mitigation
-
-當前 cancel 暴露於 mempool 有 1× cap 風險。可選方案：commit-reveal / time-locked cancel / private mempool（Flashbots）。
+### 10.6 Front-Running Mitigation
+Currently, a cancellation transaction floating in the public mempool faces a 1x cap front-running exposure. Future fixes include commit-reveal structures or submitting via private mempools (e.g., Flashbots).
 
 ---
 
-## Appendix A：檔案結構
+## Appendix A: File Directory Structure
 
 ```
 contracts/
-├── SmartWallet.sol               # 主合約
-├── SmartWalletFactory.sol        # CREATE2 factory
+├── SmartWallet.sol               # Main wallet implementation
+├── SmartWalletFactory.sol        # CREATE2 factory deployer
 ├── interfaces/
-│   └── ISmartWallet.sol         # interface
+│   └── ISmartWallet.sol         # Core system interfaces
 └── mocks/
-    ├── MockEntryPoint.sol       # 本地測試用
-    └── MockMerchant.sol         # CEI 驗證用
+    ├── MockEntryPoint.sol       # Local testing entrypoint stub
+    └── MockMerchant.sol         # Reentrancy check mock contract
 
 scripts/
-├── deploy.js                    # 部署 factory + merchant
-├── demo.js                      # local self-bundling demo
-└── demo-sepolia.js              # Sepolia real bundler demo
+├── deploy.js                    # Factory + Merchant deployment script
+├── demo.js                      # Local self-bundling pipeline demonstration
+└── demo-sepolia.js              # Sepolia end-to-end bundler validation script
 
 test/
 ├── SmartWallet.test.js
@@ -382,9 +373,9 @@ test/
 └── helpers/userOp.js
 
 docs/
-├── spec.md                      # 規格書
-├── architecture.md              # 本文件
-├── security-analysis.md         # 安全分析
-├── learning-checklist.md        # 答辯學習清單
-└── progress.md                  # 進度追蹤
+├── spec.md                      # Functional Specifications
+├── architecture.md              # Current Architectural Document
+├── security-analysis.md         # Comprehensive Security Analysis
+├── learning-checklist.md        # Defense and Q&A Preparation Checklist
+└── progress.md                  # Development Progress Log
 ```
