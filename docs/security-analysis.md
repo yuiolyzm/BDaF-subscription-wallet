@@ -307,20 +307,3 @@ receive() external payable {
 | ERC-7562 compliance | Sepolia run (Alchemy bundler) | ✓ all 7 UserOps accepted |
 | Front-run boundary | 邏輯分析 + Sepolia Phase 4 | ✓ bundler simulation 直接拒收 |
 | Etherscan verification | Etherscan UI | ✓ Factory + Merchant verified |
-
----
-
-## 7. 答辯重點摘要
-
-最有可能被問的安全議題（按優先級）：
-
-1. **「重入會發生在哪？怎麼擋？怎麼證明？」** → CEI + Strategy B
-2. **「使用者取消後商家還能扣到錢嗎？」** → 1× cap front-run + Sepolia Phase 4 證明
-3. **「為什麼 validateUserOp return 1 而非 revert？」** → bundler reputation + spec convention
-4. **「如果有人假冒你的 wallet 發 UserOp？」** → ecrecover + chainId + entryPoint addr
-5. **「Etherscan AI 說你 CEI 名字寫錯？」** → 反駁：AI 寫錯了，正確是 Checks-Effects-Interactions
-6. **「為什麼 prefund 不設 gas limit？」** → ERC-4337 spec 要求，違反會破壞 ERC-7562
-7. **「商家把 receive 搞爛 charge 會卡住嗎？」** → revert propagate，其他訂閱不受影響
-8. **「為什麼不實作 Paymaster？」** → scope 取捨 + 設計分析見 §6
-9. **「user 私鑰被偷怎辦？」** → 承認 out of scope，未來可加 social recovery
-10. **「三模式為何不分三個 function？」** → 參數空間 vs 邏輯分支
