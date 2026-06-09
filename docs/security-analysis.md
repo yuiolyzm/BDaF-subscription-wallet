@@ -1,83 +1,82 @@
-# 安全分析文件 — BDaF Subscription Wallet
+# Security Analysis Document — BDaF Subscription Wallet
 
-> 訂閱錢包合約安全性分析 + 攻擊向量列表 + 防禦機制驗證
-> Version: 1.0 | 對應 SmartWallet.sol Solidity 0.8.28
+> Subscription Wallet Contract Security Analysis + Attack Vector Mapping + Mitigation Verification
+> Version: 1.0 | Corresponds to SmartWallet.sol Solidity 0.8.28
 
 ---
 
 ## 1. Threat Model
 
-### 1.1 被保護的資產
+### 1.1 Protected Assets
 
-- **User 的 ETH**：儲存在 SmartWallet 餘額
-- **訂閱授權**：subscriptions mapping 的 active/cap/interval/expiry
-- **Owner 的控制權**：透過私鑰簽名行使
+- **User ETH Balance**: Deposited and held natively within the `SmartWallet` balance.
+- **Subscription Authorizations**: Parameters locked inside the `subscriptions` mapping state (`active`, `cap`, `interval`, `expiry`).
+- **Owner Governance**: Root control handled through the cryptographic signature of the owner's private key.
 
-### 1.2 潛在攻擊者
+### 1.2 Potential Attack Vectors & Actors
 
-| 攻擊者 | 動機 | 能力 |
+| Attacker Profile | Motivation | Capability |
 |-------|------|------|
-| **惡意商家** | 多扣錢 / 取消後仍扣款 | 可呼叫 charge()、可 front-run mempool |
-| **第三方** | 假冒 user / 偷取 ETH | 可送 UserOp、可監聽 mempool |
-| **惡意 bundler** | 審查 / 偏袒商家 | 可拒收某些 op、無法竄改 op 內容 |
-| **失能 user** | 不適用攻擊者，但需設計保護 | 私鑰遺失 / 失聯 |
+| **Malicious Merchant** | Overcharging user accounts / charging post-cancellation | Invokes `charge()`, can monitor and front-run the public mempool |
+| **Malicious Third Party**| Spoofing user execution / stealing wallet funds | Submits arbitrary UserOps, monitors mempool transactions |
+| **Malicious Bundler** | Censoring user transactions / colluding with merchants | Can censor or delay UserOps; cannot alter signature payload |
+| **Compromised User** | Not a threat actor, but represents operational risk | Private key lost, stolen, or entirely unavailable |
 
-### 1.3 信任假設
+### 1.3 Trust Assumptions
 
-| 信任對象 | 信任程度 | 理由 |
+| Entity | Trust Level | Justification |
 |---------|---------|------|
-| EVM | 完全信任 | 協定保證 |
-| EntryPoint v0.7 (canonical) | 完全信任 | Audited、deterministic 部署 |
-| OpenZeppelin contracts | 信任 | Production-grade、industry standard |
-| Bundler | **不信任** | 可能審查，但無法竄改 |
-| Merchant | **不信任** | 可能多扣 / front-run |
-| Paymaster (若有) | 部分信任 | 設計上限制可做的事 |
+| **EVM Execution Environment**| Absolute Trust | Core layer protocol guarantees |
+| **EntryPoint v0.7 Contract** | Absolute Trust | Canonical canonical deployment, audited code |
+| **OpenZeppelin Standard Libraries**| High Trust | Production-grade industry standards |
+| **Bundler Infrastructure** | **Zero Trust** | May censor or front-run, but cannot modify signatures |
+| **Merchant Entities** | **Zero Trust** | May attempt overcharging or front-running cancellations |
+| **Paymaster (If applicable)**| Partial Trust | Sandboxed and strictly limited by ERC-4337 validation rules |
 
 ---
 
-## 2. 防禦機制
+## 2. Defensive Mechanisms
 
-### 2.1 Access Control 分層
+### 2.1 Layered Access Control
 
-| Function | Modifier | 理由 |
+| Function | Modifier | Rationale |
 |----------|---------|------|
-| `validateUserOp` | onlyEntryPoint | 只有 EntryPoint 可觸發驗證 |
-| `execute` | onlyEntryPoint OR onlyOwner | UserOp 路徑 + 直接呼叫路徑 |
-| `createSubscription` | onlyOwner | 只有 user 能授權扣款 |
-| `cancelSubscription` | onlyOwner | 只有 user 能撤銷 |
-| `charge` | public（但由 subscriptionId 控管） | 商家或 self-call 觸發 |
+| `validateUserOp` | `onlyEntryPoint` | Restricts account validation triggering exclusively to the EntryPoint |
+| `execute` | `onlyEntryPoint` OR `onlyOwner` | Allows UserOp execution pathways alongside direct owner call pathways |
+| `createSubscription` | `onlyOwner` | Confines subscription authorization power strictly to the user |
+| `cancelSubscription` | `onlyOwner` | Restricts cancellation rights entirely to the user |
+| `charge` | `public` | Globally executable, but completely gated by `subscriptionId` rules |
 
-**關鍵設計**：onlyOwner 明確排除 `address(this)`，避免合約自呼叫繞權限：
+**Critical Edge-Case Design**: The `onlyOwner` design explicitly isolates `address(this)` to block a contract from accidentally bypassing permissions via inner self-calls:
 
 ```solidity
 require(
     msg.sender == entryPoint || msg.sender == owner,
     "SmartWallet: not authorized"
 );
-// 注意：address(this) 不在 allowed list
+// Note: address(this) is explicitly excluded from the permitted access list
 ```
 
-### 2.2 三層扣款防護
+### 2.2 Three-Layer Charge Protection
 
-每次 charge() 必須通過三道檢查：
+Every execution of `charge()` must successfully pass through a three-layer validation matrix:
 
-| 防線 | 防什麼 | 失效後果 |
-|------|--------|---------|
-| `amount ≤ maxAmountPerCharge` | 單次金額被坑 | 商家可一次扣到錢包空 |
-| `block.timestamp ≥ lastChargedAt + interval` | 高頻連扣 | 商家可一個 block 內連扣 |
-| `block.timestamp < expiry` | 永久授權風險 | 商家可永遠扣（user 失聯也擋不住） |
+| Defense Line | Mitigation Target | Failure Consequence |
+|------|------|------|
+| `amount <= s.maxAmountPerCharge` | Single transaction drainage | Merchant could drain the entire wallet balance in one go |
+| `block.timestamp >= lastChargedAt + interval` | High-frequency burst charging | Merchant could submit multiple drain calls in a single block |
+| `block.timestamp < s.expiry` | Perpetual authorization risk | Merchant could charge indefinitely, ignoring user loss-of-activity |
 
-**三道一起的數學保證**：
-
+**Mathematical Risk Boundary**:
+The combination of these three defenses establishes an absolute cap on worst-case financial exposure:
 ```
-商家最大可扣總額 = maxAmountPerCharge × ⌊(expiry - now) / interval⌋
+Maximum Allowable Drain = maxAmountPerCharge × ⌊(expiry - now) / interval⌋
 ```
+This loss is deterministic and bounded, enabling users to evaluate their maximum financial exposure before signing the initialization transaction.
 
-有限且可預估，user 簽授權時就能算出最壞情況。
+### 2.3 CEI (Checks-Effects-Interactions) Protection Against Reentrancy
 
-### 2.3 CEI (Checks-Effects-Interactions) 防重入
-
-**正確順序**（已在 SmartWallet.charge 實作）：
+**Correct Execution Ordering** (Implemented within `SmartWallet.charge`):
 
 ```solidity
 function charge(bytes32 subId, uint256 amount) external {
@@ -87,223 +86,164 @@ function charge(bytes32 subId, uint256 amount) external {
     require(block.timestamp >= s.lastChargedAt + s.interval);
     require(block.timestamp < s.expiry);
     
-    // E — Effects（先寫 state）
+    // E — Effects (State updated prior to external call)
     s.lastChargedAt = block.timestamp;
     
-    // I — Interactions（最後 external call）
+    // I — Interactions (External contract call executed last)
     (bool ok, ) = s.merchant.call{value: amount}("");
     require(ok);
 }
 ```
 
-**驗證方法 — MockMerchant Strategy B**：
-
-商家在 `receive()` 內主動 try-reenter charge，若 CEI 有效則被 revert：
-
+**Verification Method — MockMerchant Strategy B**:
+The mock merchant attempts a reentrancy attack by calling `charge()` within its own `receive()` fallback loop. If CEI is working correctly, the re-entrant call fails:
 ```solidity
 receive() external payable {
     totalReceived += msg.value;
     try targetWallet.charge(targetSubId, 1) {
-        reentryCount++;  // CEI 失效才會進這裡
+        reentryCount++;  // Increments only if CEI fails
     } catch {
-        // 預期路徑：CEI 擋住重入
+        // Expected path: Reentrancy blocked by state checks
     }
 }
 ```
-
-**斷言**：`totalReceived == amount` 且 `reentryCount == 0`。
+**Assertion**: `totalReceived == amount` and `reentryCount == 0`.
 
 ### 2.4 Replay Protection
 
-| 攻擊向量 | 防禦機制 |
+| Attack Vector | Defense Mechanism |
 |---------|---------|
-| 同鏈 replay（同 UserOp 重送） | EntryPoint.nonce mapping，sender + nonceKey 唯一 |
-| 跨鏈 replay | userOpHash 包含 `chainId` |
-| 跨 EntryPoint 版本 replay | userOpHash 包含 `entryPoint address` |
+| **Intra-chain Replay** (Resubmitting the same UserOp) | Managed by `EntryPoint` tracking a unique `sender` -> `nonce` map |
+| **Cross-chain Replay** | The `userOpHash` incorporates the unique domain `chainId` |
+| **Cross-EntryPoint Version Replay** | The `userOpHash` signs the explicit `entryPoint` contract address |
 
 ### 2.5 ERC-7562 Storage Rule Compliance
 
-`validateUserOp` 只能讀寫受限的 storage，本實作符合：
+The `validateUserOp` execution is bound by strict storage access rules to maintain bundler network safety. This implementation perfectly complies with:
+- ✅ Only reads `owner` configuration (the account's own storage slot).
+- ✅ Validates signatures via the precompiled `ecrecover` engine (fixed gas cost).
+- ✅ Prepays the `prefund` pool without declaring artificial inner gas caps (spec requirement).
+- ✅ Avoids time-dependent, oracle-dependent, or external state-dependent code blocks.
 
-- ✅ 只讀 `owner`（自己的 storage slot）
-- ✅ 簽名驗證用 `ecrecover` precompile（固定 gas）
-- ✅ 補 prefund 不設 gas limit（spec 要求）
-- ✅ 無 time-dependent / oracle-dependent / external state-dependent 邏輯
-
-**Sepolia run 驗證**：Alchemy bundler 接受 7 個 UserOp（包含部署、charge、cancelled charge），證明合約符合 ERC-7562。
+**Sepolia Test Validation**: Live Alchemy bundlers accepted all 7 consecutive UserOps without encountering compliance exceptions, verifying adherence to ERC-7562.
 
 ---
 
-## 3. 攻擊向量分析
+## 3. Attack Vector Analysis
 
-### 3.1 商家試圖多扣錢
+### 3.1 Merchant Attempts to Overcharge
 
-**攻擊路徑 1：reentrancy**
-- 機制：merchant 在 receive 內 reenter charge()
-- 防禦：CEI 確保 lastChargedAt 已更新，interval check fail → revert
-- 驗證：MockMerchant Strategy B 證明 reentryCount == 0
+- **Vector 1: Reentrancy Attack**
+  - *Mechanism*: Merchant forces reentrancy inside the `receive()` transfer fallback handler.
+  - *Defense*: CEI ensures `lastChargedAt` updates before the transfer. The re-entrant call hits the interval check and reverts.
+  - *Proof*: Verified via `MockMerchant Strategy B` confirming `reentryCount == 0`.
 
-**攻擊路徑 2：高頻連扣**
-- 機制：商家在同 block 連送多筆 charge tx
-- 防禦：interval check 擋住所有後續 charge（lastChargedAt 已更新）
+- **Vector 2: Single-Block High-Frequency Charging**
+  - *Mechanism*: Merchant submits several `charge()` transactions within a single block.
+  - *Defense*: The `interval` check blocks all subsequent calls since `lastChargedAt` updates instantly during the first valid execution.
 
-**攻擊路徑 3：跨 interval 邊界 timing**
-- 機制：interval 到的瞬間連扣兩次
-- 結論：**這是合法操作**（user 簽授權同意「每 interval 一次 max」），不算偷扣
-- 緩解：user 應審視 interval × max × duration 的總曝險
+- **Vector 3: Multi-Interval Boundary Exploitation**
+  - *Mechanism*: Merchant charges right before and right after an interval boundary.
+  - *Analysis*: **This is valid behavior.** The user explicitly authorized a maximum amount per interval. It is not an exploit, but rather an expected capability.
+  - *Mitigation*: Users must evaluate total financial exposure (`interval` × `max` × `duration`) prior to signing.
 
-**攻擊路徑 4：偽造 subscription**
-- 機制：商家嘗試直接創建有利於自己的 subscription
-- 防禦：createSubscription 有 onlyOwner
+- **Vector 4: Forged Subscriptions**
+  - *Mechanism*: Merchant attempts to inject an authorized subscription mapping entry directly.
+  - *Defense*: Gated by the `createSubscription` function's `onlyOwner` modifier.
 
-### 3.2 User 取消後商家仍能扣款
+### 3.2 Merchant Charges Funds Post-Cancellation
 
-**Front-run 攻擊**：
-- 機制：商家監聽 mempool 看到 cancel tx，搶在 cancel 之前送 charge tx（給更高 gas）
-- 損失上限：**一次 `maxAmountPerCharge`**（interval check 擋住連扣）
-- 驗證：見 Sepolia run Phase 4 — Netflix/Billing cancel 後 charge 被 bundler simulation 直接拒收
+- **Front-Running Attack**
+  - *Mechanism*: A merchant monitors the public mempool for a user's `cancelSubscription()` transaction and immediately broadcasts a higher-gas `charge()` transaction to slip in right before the cancellation.
+  - *Maximum Financial Exposure*: Limited to exactly **one** `maxAmountPerCharge` payment, as the interval check blocks further exploits.
+  - *Validation*: On Sepolia (Phase 4), a post-cancellation charge is caught by the bundler's transaction simulation and **rejected before landing on-chain**, minimizing risk.
 
-**Mitigation 方案**（未實作，分析如下）：
+- **Mitigation Matrix (Alternative Explored Designs)**:
 
-| 方案 | 機制 | Trade-off |
+| Mitigation Architecture | Operational Flow | Trade-offs & Limitations |
 |------|------|----------|
-| Commit-reveal cancel | 先送 hash → 等 N block → reveal | cancel 變慢，UX 差 |
-| Time-locked cancel | cancel 命令延遲 N block 生效 | 被掏空時間可能更長 |
-| Private mempool | 透過 Flashbots 等管道送 cancel | 依賴第三方 |
-| Expiry-only model | 不允許主動 cancel，只用 expiry 自動失效 | 失去彈性 |
+| **Commit-Reveal Cancellation** | Submit hash commitment → wait N blocks → reveal cancellation | Slows down processing; reduces user experience smoothness |
+| **Time-Locked Cancellation** | Cancellation commands execute after an N-block cooldown | Lengthens exposure window, allowing potential extra charges |
+| **Private Mempools** | Routes cancellation actions via Flashbots channels | Introduces dependencies on external third-party infrastructure |
+| **Expiry-Only Model** | Disallows active cancellations; relies on automatic expiration | Removes user flexibility to end subscriptions early |
 
-**設計選擇**：本專案接受 1× cap 的 front-run 風險，因為：
-- Netflix/Billing 的 cap ≈ 訂閱費，損失等於多扣一期，可接受
-- Usage 用短 expiry 規避 active cancel 需求（dead-man-switch）
+**Architectural Trade-Off**: This implementation accepts a 1x cap front-running risk because:
+- For Netflix or standard billing models, the single cap matches a single billing period, which is an acceptable financial risk boundary.
+- For usage-based models, brief expiration windows (`expiry`) eliminate the need for active user-driven cancellations.
 
-### 3.3 第三方假冒 user 發 UserOp
+### 3.3 Third-Party Impersonation Attacks
 
-**攻擊機制**：攻擊者建構 UserOp，sender = user wallet
+- *Mechanism*: A malicious actor crafts a `UserOperation` setting the user's smart wallet as the `sender`.
+- *Defense*: The attacker cannot forge the owner's private cryptographic signature. `validateUserOp` will fail the `ecrecover` validation check and return `1`, causing the bundler network to instantly drop the invalid transaction.
 
-**防禦**：
-- 攻擊者不知 owner 私鑰，無法產生有效簽名
-- `validateUserOp` 內 `ecrecover(userOpHash, sig) != owner` → return 1 → bundler 拒收
+### 3.4 Bundler and Merchant Collusion
 
-### 3.4 Bundler 與商家串通
+- *Mechanism*: A malicious bundler prioritizes a merchant's `charge()` operation over a user's cancellation.
+- *Defense*: A bundler **cannot bypass the EntryPoint's validation requirements**. Nonces, balances, and signatures are strictly validated. Collusion only alters block ordering (letting the merchant charge one block earlier), but can never bypass contract rules.
+- *Mitigation*: Users can easily route transactions to alternative bundler networks or execute self-bundling pipelines.
 
-**機制**：bundler 偏袒商家、優先打包商家的 charge tx
+### 3.5 Merchant Intentionally Reverts the `receive()` Fallback
 
-**防禦**：
-- Bundler **無法跳過 EntryPoint validation**
-- 簽名 / nonce / state check 在 EntryPoint 強制執行
-- 結果：bundler 偏袒最多達成「商家的 op 早一個 block 上鏈」，但無法繞過合約檢查
+- *Mechanism*: The merchant's receiving contract reverts inside its fallback, breaking the `charge()` routing.
+- *Outcome*: The `require(ok)` statement triggers a full transaction rollback, resetting `lastChargedAt`. The merchant fails to collect funds, harming only themselves, while **other independent subscriptions inside the mapping remain completely unaffected.**
+- *Design Decision*: We intentionally choose not to wrap the call in a `try/catch` block. Swallowing failures would mask transfer errors, creating inconsistent user records where a transaction appears successful but funds never arrived.
 
-**Mitigation**：user 可換 bundler、自行 bundle（self-bundling）。
+### 3.6 Compromised User Private Key
 
-### 3.5 商家把 receive 函數搞爛
+- *Outcome*: The attacker gains full signature authority, enabling them to alter ownership, cancel subscriptions, or drain assets.
+- *Status*: Excluded from the current scope.
+- *Future Mitigation*: Social recovery networks, multi-sig constraints, and guardian architectures.
 
-**機制**：merchant.receive() revert，導致 charge() 內 transfer 失敗
+### 3.7 EntryPoint Core Protocol Upgrade
 
-**結果**：
-- charge() 的 `require(ok)` 觸發 revert
-- 整個 tx 回滾，包括 lastChargedAt 更新
-- 商家自己扣不到錢（grief 自己）
-- **其他 subscription 不受影響**（state per subId）
-
-**Trade-off 分析**：是否應該 try/catch 吞掉 receive 失敗？
-- 吞掉：商家無法 grief 自己，但 user history 出現「轉帳成功但對方沒收到」
-- 不吞：對應錢扣不到，但邏輯一致
-- **本實作選擇不吞**（讓 revert 自然往上）
-
-### 3.6 User 私鑰被偷
-
-**結果**：
-- 攻擊者可發任意 UserOp（cancel 所有訂閱、掏空 wallet）
-- **超出本實作 scope**
-
-**Future work**：social recovery / multisig / guardian-based 設計
-
-### 3.7 EntryPoint 升級
-
-**機制**：v0.7 升 v0.8，本 wallet immutable entryPoint 無法跟上
-
-**結果**：wallet 在新版生態系失效
-
-**Mitigation**：production 通常 proxy pattern + 遷移到新版 wallet 部署。本專案 scope 不含。
-
-### 3.8 商家 contract 升級
-
-**機制**：merchant 用 proxy pattern，升級實作合約
-
-**結果**：
-- subscription 綁定 merchant address，proxy 地址不變 → subscription 仍指向同一 entity
-- 但 proxy 後的邏輯可能變壞（例：偷偷加 fee）
-- **語意上**：user 訂閱 = 信任那個 address。如果 merchant 改邏輯，user 應視為新主體並評估
-
-**Mitigation**：user 應檢查 merchant 是否為 proxy、proxy admin 是誰
-
-### 3.9 Replay 攻擊
-
-| 場景 | 防禦 |
-|------|------|
-| 同 nonce 重送 | EntryPoint 維護 sender → nonce mapping |
-| 跨鏈 replay | userOpHash 包含 chainId |
-| 跨 EntryPoint 版本 | userOpHash 包含 entryPoint address |
-| Cancel 後重送舊 charge UserOp | 即使簽名有效，charge() 內 `s.active` check fail |
-
-### 3.10 同一個 owner + merchant 訂閱多次
-
-**機制**：user 為同一個 merchant 創 N 個 subscription
-
-**結果**：
-- subscriptionId = keccak256(wallet, merchant, subscriptionNonce)，nonce 遞增 → 不會撞 ID
-- 多個 subscription **獨立計算 interval / cap**
-- **不是漏洞，是 UX 問題**（user 應自我管理訂閱列表）
+- *Mechanism*: Migration from EntryPoint v0.7 to v0.8 occurs while the smart wallet retains an immutable address reference.
+- *Outcome*: The wallet becomes incompatible with updated ecosystem frameworks.
+- *Mitigation*: Production architectures employ a proxy upgrade framework to handle cross-version migrations. This remains future work for this teaching project.
 
 ---
 
-## 4. ERC-7562 Compliance 驗證
+## 4. ERC-7562 Compliance Verification
 
 ### 4.1 Storage Access Rules
 
-| 規則 | 本實作 |
+| Rule Metric | Implementation Assessment |
 |------|--------|
-| 只讀 sender 自己的 storage | ✓ 只讀 owner |
-| 不讀外部 mutable state | ✓ 無外部依賴 |
-| 不使用 gas-dependent control flow | ✓ 無 |
-| 不使用環境變數（GASLEFT、TIMESTAMP 影響邏輯） | ✓ timestamp 只在 execution phase 用 |
+| **Read Separation** | ✓ Restricted exclusively to reading the account's own storage (`owner`) |
+| **External Dependencies** | ✓ Zero integration of mutable external states |
+| **Control Flow Bounds** | ✓ Avoids any gas-dependent branching behavior |
+| **Contextual Invariance** | ✓ Timestamp rules are strictly isolated to the execution phase |
 
-### 4.2 Banned Opcodes
+### 4.2 Banned Opcodes Audit
 
-`validateUserOp` 內**未使用**以下 opcode：
-- ❌ BLOCKHASH / COINBASE / DIFFICULTY / GASLIMIT
-- ❌ CREATE / CREATE2
-- ❌ SELFDESTRUCT
-- ❌ Inline assembly with state-changing ops
-
-**Sepolia run 證明**：Alchemy bundler 的 simulation 通過所有 7 個 UserOp，包含 deploy + charge + cancelled charge attempt。
+The validation phase inside `validateUserOp` completely avoids the following invalid opcodes:
+- ❌ `BLOCKHASH` / `COINBASE` / `DIFFICULTY` / `GASLIMIT`
+- ❌ `CREATE` / `CREATE2`
+- ❌ `SELFDESTRUCT`
+- ❌ Inline assembly manipulating execution states
 
 ---
 
-## 5. 已知限制與 scope 排除
+## 5. System Limitations and Scope Matrix
 
-| 議題 | 狀態 | 處理 |
+| Risk Factor | Engineering Status | Resolution Strategy |
 |------|------|------|
-| Social Recovery | 未實作 | Future work |
-| Multi-sig owner | 未實作 | Future work |
-| EIP-712 簽名 | 未實作（用 EIP-191） | Future work（提升 UX 安全） |
-| Cross-chain support | 未實作 | 超出 scope |
-| Paymaster | 未實作（設計分析見 §6） | Tier 3 加分 |
-| EntryPoint 升級遷移 | 未實作（immutable） | Future work（proxy pattern） |
-| Calendar-aware interval | 未實作（用秒） | Future work（oracle） |
-| Front-run mitigation（commit-reveal 等） | 未實作 | 接受 1× cap 風險 |
+| **Social Recovery** | Excluded | Future architectural expansion |
+| **Multi-Sig Governance**| Excluded | Future architectural expansion |
+| **EIP-712 Signatures** | Excluded (Using EIP-191) | Future UX upgrade |
+| **Cross-Chain Routing** | Excluded | Out of scope |
+| **Paymaster Sponsorship**| Conceptualized Only | Detailed design logged in Tier 3 extensions |
+| **Calendar-Aware Logic**| Excluded (Using second-based math)| Future integration of specialized oracles |
 
 ---
 
-## 6. 安全測試清單
+## 6. Security Testing Checklist
 
-| 測試 | 工具 | 結果 |
+| Vulnerability Target | Test Tooling | Verification Result |
 |------|------|------|
-| Reentrancy（CEI 防禦） | MockMerchant Strategy B | ✓ totalReceived == amount, reentryCount == 0 |
-| Access control | Hardhat unit tests | ✓ non-owner cannot create/cancel |
-| Signature replay | manually crafted UserOp | ✓ duplicate nonce rejected |
-| Three-layer charge protection | Hardhat unit tests | ✓ amount > cap revert, interval not elapsed revert, expired revert |
-| Cancel 有效性 | demo.js Phase 4 | ✓ cancelled subscription charge fails |
-| ERC-7562 compliance | Sepolia run (Alchemy bundler) | ✓ all 7 UserOps accepted |
-| Front-run boundary | 邏輯分析 + Sepolia Phase 4 | ✓ bundler simulation 直接拒收 |
-| Etherscan verification | Etherscan UI | ✓ Factory + Merchant verified |
+| **Reentrancy (CEI)** | MockMerchant Strategy B | ✓ `totalReceived == amount`, `reentryCount == 0` |
+| **Access Control** | Hardhat Unit Testing Framework | ✓ Non-owners fail to execute admin configurations |
+| **Signature Replay** | Manually Forked UserOp Testing | ✓ Duplicate nonces are instantly dropped |
+| **Three-Layer Cap Matrix**| Hardhat Unit Testing Framework | ✓ Verified reverts on over-charging, invalid timing, and expiration |
+| **Cancellation Validity** | `demo.js` Phase 4 | ✓ Revoked subscriptions fail subsequent charge attempts |
+| **ERC-7562 Standards** | Live Sepolia Run via Alchemy | ✓ All 7 UserOps successfully pass simulation checks |
+
